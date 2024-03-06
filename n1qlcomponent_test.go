@@ -10,6 +10,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/require"
+
+	"github.com/stretchr/testify/assert"
+
 	"github.com/stretchr/testify/mock"
 )
 
@@ -972,7 +976,7 @@ func (suite *UnitTestSuite) TestN1QLEnhPreparedKnownQueryRetryPrepare4050() {
 	n1qlC := newN1QLQueryComponent(httpC, configC, newTracerComponent(&noopTracer{}, "", true, &noopMeter{}))
 
 	n1qlC.enhancedPreparedSupported = 1
-	n1qlC.queryCache.Put("SELECT 1=1", &n1qlQueryCacheEntry{
+	n1qlC.queryCache.Put(n1qlQueryCacheStatementContext{Statement: "SELECT 1=1"}, &n1qlQueryCacheEntry{
 		name: "somename",
 	})
 	test := map[string]interface{}{
@@ -1025,7 +1029,7 @@ func (suite *UnitTestSuite) TestN1QLEnhPreparedKnownQueryFailReprepare() {
 	n1qlC := newN1QLQueryComponent(httpC, configC, newTracerComponent(&noopTracer{}, "", true, &noopMeter{}))
 
 	n1qlC.enhancedPreparedSupported = 1
-	n1qlC.queryCache.Put("SELECT 1=1", &n1qlQueryCacheEntry{
+	n1qlC.queryCache.Put(n1qlQueryCacheStatementContext{Statement: "SELECT 1=1"}, &n1qlQueryCacheEntry{
 		name: "somename",
 	})
 	test := map[string]interface{}{
@@ -1256,5 +1260,338 @@ func (suite *UnitTestSuite) TestN1QLMB50643() {
 
 	suite.Assert().Equal(0, mrs.retries)
 
-	suite.Assert().True(errors.Is(err, ErrIndexFailure), "Expected doc not found but was %s", err)
+	suite.Assert().True(errors.Is(err, ErrIndexNotFound), "Expected index not found but was %s", err)
+}
+
+func (suite *UnitTestSuite) TestN1QLErrorCodes() {
+	type test struct {
+		code        uint32
+		msg         string
+		reason      map[string]interface{}
+		expectedErr error
+		raw         string
+	}
+
+	type jsonN1QLError struct {
+		Code    uint32                 `json:"code"`
+		Message string                 `json:"msg,omitempty"`
+		Reason  map[string]interface{} `json:"reason,omitempty"`
+	}
+
+	makeRaw := func(code uint32, msg string) string {
+		n1qlErr := []jsonN1QLError{
+			{
+				Code:    code,
+				Message: msg,
+			},
+		}
+
+		b, err := json.Marshal(n1qlErr)
+		suite.Require().NoError(err)
+
+		return string(b)
+	}
+
+	tests := []test{
+		{
+			code:        1000,
+			expectedErr: nil,
+		},
+		{
+			code:        3000,
+			expectedErr: errParsingFailure,
+		},
+		{
+			code:        3001,
+			expectedErr: nil,
+		},
+		{
+			code:        4000,
+			expectedErr: errPlanningFailure,
+		},
+		{
+			code:        5000,
+			expectedErr: errInternalServerFailure,
+		},
+		{
+			code:        5000,
+			expectedErr: errIndexNotFound,
+			msg:         "Index test not found",
+		},
+		{
+			code:        5000,
+			expectedErr: errIndexNotFound,
+			msg:         "Index does not exist",
+		},
+		{
+			code:        5000,
+			expectedErr: errIndexExists,
+			msg:         "Index test already exist",
+		},
+		{
+			code:        5000,
+			expectedErr: errQuotaLimitedFailure,
+			msg:         "limit for number of indexes that can be created per scope has been reached",
+		},
+		{
+			code:        10000,
+			expectedErr: errAuthenticationFailure,
+		},
+		{
+			code:        12000,
+			expectedErr: errIndexFailure,
+		},
+		{
+			code:        14000,
+			expectedErr: errIndexFailure,
+		},
+		{
+			code:        1065,
+			expectedErr: errFeatureNotAvailable,
+			msg:         "query_context",
+		},
+		{
+			code:        1065,
+			expectedErr: errFeatureNotAvailable,
+			msg:         "preserve_expiry",
+		},
+		{
+			code:        1065,
+			expectedErr: nil,
+			msg:         "something_else",
+		},
+		{
+			code:        1065,
+			expectedErr: errFeatureNotAvailable,
+			msg:         "use_replica",
+		},
+		{
+			code:        1080,
+			expectedErr: errUnambiguousTimeout,
+		},
+		{
+			code:        1191,
+			expectedErr: errRateLimitedFailure,
+		},
+		{
+			code:        1192,
+			expectedErr: errRateLimitedFailure,
+		},
+		{
+			code:        1193,
+			expectedErr: errRateLimitedFailure,
+		},
+		{
+			code:        1194,
+			expectedErr: errRateLimitedFailure,
+		},
+		{
+			code:        1197,
+			expectedErr: errFeatureNotAvailable,
+		},
+		{
+			code:        3230,
+			expectedErr: errFeatureNotAvailable,
+			msg:         "advisor",
+		},
+		{
+			code:        3230,
+			expectedErr: errFeatureNotAvailable,
+			msg:         "advise",
+		},
+		{
+			code:        3230,
+			expectedErr: errFeatureNotAvailable,
+			msg:         "query window functions",
+		},
+		{
+			code:        4040,
+			expectedErr: errPreparedStatementFailure,
+		},
+		{
+			code:        4050,
+			expectedErr: errPreparedStatementFailure,
+		},
+		{
+			code:        4060,
+			expectedErr: errPreparedStatementFailure,
+		},
+		{
+			code:        4070,
+			expectedErr: errPreparedStatementFailure,
+		},
+		{
+			code:        4080,
+			expectedErr: errPreparedStatementFailure,
+		},
+		{
+			code:        4090,
+			expectedErr: errPreparedStatementFailure,
+		},
+		{
+			code:        4300,
+			expectedErr: errIndexExists,
+		},
+		{
+			code:        12004,
+			expectedErr: errIndexNotFound,
+		},
+		{
+			code:        12016,
+			expectedErr: errIndexNotFound,
+		},
+		{
+			code: 12009,
+			reason: map[string]interface{}{
+				"code": float64(12033),
+			},
+			expectedErr: errCasMismatch,
+		},
+		{
+			code: 12009,
+			reason: map[string]interface{}{
+				"code": float64(17012),
+			},
+			expectedErr: errDocumentExists,
+		},
+		{
+			code: 12009,
+			reason: map[string]interface{}{
+				"code": float64(17014),
+			},
+			expectedErr: errDocumentNotFound,
+		},
+		{
+			code: 12009,
+			reason: map[string]interface{}{
+				"code": float64(11111),
+			},
+			expectedErr: errDMLFailure,
+		},
+		{
+			code:        13014,
+			expectedErr: errAuthenticationFailure,
+		},
+	}
+
+	for _, tt := range tests {
+		suite.T().Run(fmt.Sprintf("Error code %d", tt.code), func(t *testing.T) {
+			type respBody struct {
+				Errors []jsonN1QLError
+			}
+
+			body := respBody{
+				Errors: []jsonN1QLError{
+					{
+						Code:    tt.code,
+						Message: tt.msg,
+						Reason:  tt.reason,
+					},
+				},
+			}
+
+			b, err := json.Marshal(body)
+			assert.NoError(t, err)
+
+			raw, descs, err := parseN1QLError(b)
+			assert.ErrorIs(t, err, tt.expectedErr)
+			if tt.expectedErr == nil {
+				assert.Equal(t, makeRaw(tt.code, tt.msg), raw)
+			}
+			require.Equal(t, 1, len(descs))
+			assert.Equal(t, tt.code, descs[0].Code)
+			assert.Equal(t, tt.reason, descs[0].Reason)
+		})
+	}
+}
+
+func (suite *UnitTestSuite) TestN1QLEnhPreparedDifferentiatesQueryContext() {
+	body := []byte(`{"results":[]}`)
+	r := ioutil.NopCloser(bytes.NewReader(body))
+	resp := &HTTPResponse{
+		Endpoint:      "whatever",
+		StatusCode:    200,
+		ContentLength: int64(len(body)),
+		Body:          r,
+	}
+	r2 := ioutil.NopCloser(bytes.NewReader(body))
+	resp2 := &HTTPResponse{
+		Endpoint:      "whatever",
+		StatusCode:    200,
+		ContentLength: int64(len(body)),
+		Body:          r2,
+	}
+
+	configC := new(mockConfigManager)
+	configC.On("AddConfigWatcher", mock.Anything)
+
+	httpC := new(mockHttpComponentInterface)
+	httpC.On("DoInternalHTTPRequest", mock.AnythingOfType("*gocbcore.httpRequest"), false).
+		Return(resp, nil).Once().Run(func(args mock.Arguments) {
+		req := args.Get(0).(*httpRequest)
+		var body map[string]interface{}
+		suite.Require().NoError(json.Unmarshal(req.Body, &body))
+
+		statement := body["prepared"]
+		suite.Assert().Equal("cluster_level_plan", statement)
+
+		suite.Assert().NotContains(body, "auto_execute")
+	})
+	httpC.On("DoInternalHTTPRequest", mock.AnythingOfType("*gocbcore.httpRequest"), false).
+		Return(resp2, nil).Once().Run(func(args mock.Arguments) {
+		req := args.Get(0).(*httpRequest)
+		var body map[string]interface{}
+		suite.Require().NoError(json.Unmarshal(req.Body, &body))
+
+		statement := body["prepared"]
+		suite.Assert().Equal("scope_level_plan", statement)
+
+		suite.Assert().NotContains(body, "auto_execute")
+	})
+
+	n1qlC := newN1QLQueryComponent(httpC, configC, newTracerComponent(&noopTracer{}, "", true, &noopMeter{}))
+
+	n1qlC.enhancedPreparedSupported = 1
+	n1qlC.queryCache.Put(n1qlQueryCacheStatementContext{Statement: "SELECT 1=1"}, &n1qlQueryCacheEntry{
+		name: "cluster_level_plan",
+	})
+	n1qlC.queryCache.Put(n1qlQueryCacheStatementContext{Statement: "SELECT 1=1", Context: "default.test"}, &n1qlQueryCacheEntry{
+		name: "scope_level_plan",
+	})
+	test := map[string]interface{}{
+		"statement":         "SELECT 1=1",
+		"client_context_id": "1234",
+	}
+	payload, err := json.Marshal(test)
+	suite.Require().Nil(err, err)
+
+	waitCh := make(chan error, 1)
+	_, err = n1qlC.PreparedN1QLQuery(N1QLQueryOptions{
+		Payload:       payload,
+		RetryStrategy: NewBestEffortRetryStrategy(nil),
+		Deadline:      time.Now().Add(100 * time.Millisecond),
+	}, func(reader *N1QLRowReader, err error) {
+		waitCh <- err
+	})
+	suite.Require().NoError(err, err)
+	suite.Require().NoError(<-waitCh)
+
+	test = map[string]interface{}{
+		"statement":         "SELECT 1=1",
+		"client_context_id": "1234",
+		"query_context":     "default.test",
+	}
+	payload, err = json.Marshal(test)
+	suite.Require().Nil(err, err)
+
+	waitCh = make(chan error, 1)
+	_, err = n1qlC.PreparedN1QLQuery(N1QLQueryOptions{
+		Payload:       payload,
+		RetryStrategy: NewBestEffortRetryStrategy(nil),
+		Deadline:      time.Now().Add(100 * time.Millisecond),
+	}, func(reader *N1QLRowReader, err error) {
+		waitCh <- err
+	})
+	suite.Require().NoError(err, err)
+	suite.Require().NoError(<-waitCh)
 }

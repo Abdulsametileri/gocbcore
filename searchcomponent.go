@@ -6,7 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"io/ioutil"
+	"net/url"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -37,6 +39,8 @@ func (q *SearchRowReader) Close() error {
 
 // SearchQueryOptions represents the various options available for a search query.
 type SearchQueryOptions struct {
+	BucketName    string
+	ScopeName     string
 	IndexName     string
 	Payload       []byte
 	RetryStrategy RetryStrategy
@@ -113,16 +117,65 @@ func parseSearchError(req *httpRequest, indexName string, query interface{}, res
 	return errOut
 }
 
+type SearchCapability uint32
+
+const (
+	SearchCapabilityScopedIndexes SearchCapability = iota
+	SearchCapabilityVectorSearch
+)
+
 type searchQueryComponent struct {
 	httpComponent *httpComponent
+	cfgMgr        configManager
 	tracer        *tracerComponent
+
+	caps     map[SearchCapability]CapabilityStatus
+	capsLock sync.RWMutex
 }
 
-func newSearchQueryComponent(httpComponent *httpComponent, tracer *tracerComponent) *searchQueryComponent {
-	return &searchQueryComponent{
+func newSearchQueryComponent(httpComponent *httpComponent, cfgMgr configManager, tracer *tracerComponent) *searchQueryComponent {
+	sqc := &searchQueryComponent{
 		httpComponent: httpComponent,
+		cfgMgr:        cfgMgr,
 		tracer:        tracer,
+
+		caps: map[SearchCapability]CapabilityStatus{
+			SearchCapabilityVectorSearch:  CapabilityStatusUnknown,
+			SearchCapabilityScopedIndexes: CapabilityStatusUnknown,
+		},
 	}
+	cfgMgr.AddConfigWatcher(sqc)
+
+	return sqc
+}
+
+func (sqc *searchQueryComponent) OnNewRouteConfig(cfg *routeConfig) {
+	sqc.capsLock.Lock()
+	defer sqc.capsLock.Unlock()
+
+	if cfg.ContainsClusterCapability(1, "search", "vectorSearch") {
+		sqc.caps[SearchCapabilityVectorSearch] = CapabilityStatusSupported
+	} else {
+		sqc.caps[SearchCapabilityVectorSearch] = CapabilityStatusUnsupported
+	}
+
+	if cfg.ContainsClusterCapability(1, "search", "scopedSearchIndex") {
+		sqc.caps[SearchCapabilityScopedIndexes] = CapabilityStatusSupported
+	} else {
+		sqc.caps[SearchCapabilityScopedIndexes] = CapabilityStatusUnsupported
+	}
+}
+
+func (sqc *searchQueryComponent) capabilityStatus(cap SearchCapability) CapabilityStatus {
+	sqc.capsLock.RLock()
+	defer sqc.capsLock.RUnlock()
+
+	status, ok := sqc.caps[cap]
+	if !ok {
+		return CapabilityStatusUnsupported
+	}
+
+	return status
 }
 
 // SearchQuery executes a Search query
@@ -149,11 +202,31 @@ func (sqc *searchQueryComponent) SearchQuery(opts SearchQueryOptions, cb SearchQ
 		ctlMap = make(map[string]interface{})
 	}
 
+	if opts.BucketName != "" && opts.ScopeName != "" {
+		if sqc.capabilityStatus(SearchCapabilityScopedIndexes) == CapabilityStatusUnsupported {
+			return nil, wrapSearchError(nil, "", nil,
+				wrapError(errFeatureNotAvailable, "scoped search indexes are not supported by this cluster version"), 0)
+		}
+	}
+
+	if _, ok := payloadMap["knn"]; ok {
+		if sqc.capabilityStatus(SearchCapabilityVectorSearch) == CapabilityStatusUnsupported {
+			return nil, wrapSearchError(nil, "", nil,
+				wrapError(errFeatureNotAvailable, "vector search is not supported by this cluster version"), 0)
+		}
+	}
+
 	indexName := opts.IndexName
 	query := payloadMap["query"]
 
 	ctx, cancel := context.WithCancel(context.Background())
-	reqURI := fmt.Sprintf("/api/index/%s/query", opts.IndexName)
+	var reqURI string
+	if opts.BucketName != "" && opts.ScopeName != "" {
+		reqURI = fmt.Sprintf("/api/bucket/%s/scope/%s/index/%s/query",
+			url.PathEscape(opts.BucketName), url.PathEscape(opts.ScopeName), url.PathEscape(opts.IndexName))
+	} else {
+		reqURI = fmt.Sprintf("/api/index/%s/query", url.PathEscape(opts.IndexName))
+	}
 	ireq := &httpRequest{
 		Service:          FtsService,
 		Method:           "POST",

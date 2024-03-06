@@ -313,9 +313,10 @@ func createAgent(config *AgentConfig) (*Agent, error) {
 		c.tracer,
 		c.dialer,
 		&kvMuxState{
-			tlsConfig:      tlsConfig,
-			authMechanisms: c.authMechanisms,
-			auth:           config.SecurityConfig.Auth,
+			tlsConfig:          tlsConfig,
+			authMechanisms:     c.authMechanisms,
+			auth:               config.SecurityConfig.Auth,
+			expectedBucketName: c.bucketName,
 		},
 	)
 	c.collections = newCollectionIDManager(
@@ -408,7 +409,7 @@ func createAgent(config *AgentConfig) (*Agent, error) {
 	c.stats = newStatsComponent(c.kvMux, c.defaultRetryStrategy, c.tracer)
 	c.n1ql = newN1QLQueryComponent(c.http, c.cfgManager, c.tracer)
 	c.analytics = newAnalyticsQueryComponent(c.http, c.tracer)
-	c.search = newSearchQueryComponent(c.http, c.tracer)
+	c.search = newSearchQueryComponent(c.http, c.cfgManager, c.tracer)
 	c.views = newViewQueryComponent(c.http, c.tracer)
 
 	// Kick everything off.

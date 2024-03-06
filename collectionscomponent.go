@@ -75,9 +75,7 @@ func (cidMgr *collectionsComponent) OnNewRouteConfig(cfg *routeConfig) {
 }
 
 func (cidMgr *collectionsComponent) handleCollectionUnknown(req *memdQRequest) bool {
-	// We cannot retry requests with no collection information.
-	// This also prevents the GetCollectionID requests from being automatically retried.
-	if isDefaultCollection(req.ScopeName, req.CollectionName) {
+	if !canRetryOnCollectionUnknown(req) {
 		return false
 	}
 
@@ -85,6 +83,13 @@ func (cidMgr *collectionsComponent) handleCollectionUnknown(req *memdQRequest) b
 	if shouldRetry {
 		go func() {
 			time.Sleep(time.Until(retryTime))
+			if isDefaultCollection(req.ScopeName, req.CollectionName) {
+				// If the request is against the default collection then there's no point trying to
+				// refresh the cid, instead we just retry the operation.
+				cidMgr.dispatcher.RequeueDirect(req, true)
+				return
+			}
+
 			cidMgr.requeue(req)
 		}()
 	}
@@ -260,7 +265,7 @@ func (cidMgr *collectionsComponent) GetAllCollectionManifests(opts GetAllCollect
 			RootTraceContext: opts.TraceContext,
 		}
 
-		curOp, err := cidMgr.dispatcher.DispatchDirectToAddress(req, pipeline)
+		curOp, err := cidMgr.dispatcher.DispatchDirectToAddress(req, pipeline.Address())
 		if err == nil {
 			setTimer(req)
 
@@ -506,12 +511,12 @@ func (cid *collectionIDCache) refreshCid(req *memdQRequest) error {
 
 			// We successfully got the cid, the GetCollectionID itself will have handled setting the ID on this cache,
 			// so lets reset the op queue and requeue all of our requests.
-			logDebugf("Collection %s.%s refresh succeeded, requeuing requests", req.ScopeName, req.CollectionName)
 			cid.lock.Lock()
 			opQueue := cid.opQueue
 			cid.opQueue = newMemdOpQueue()
 			cid.lock.Unlock()
 
+			logDebugf("Collection %s.%s refresh succeeded, requeuing %d requests", req.ScopeName, req.CollectionName, opQueue.items.Len())
 			opQueue.Close()
 			opQueue.Drain(func(request *memdQRequest) {
 				request.AddResourceUnitsFromUnitResult(result.Internal.ResourceUnits)
@@ -538,7 +543,18 @@ func (cid *collectionIDCache) dispatch(req *memdQRequest) error {
 	case unknownCid:
 		logDebugf("Collection %s.%s unknown, refreshing id", req.ScopeName, req.CollectionName)
 		cid.setID(pendingCid)
-		cid.opQueue = newMemdOpQueue()
+		newOpQueue := newMemdOpQueue()
+		if cid.opQueue != nil {
+			// Drain the old queue into the new one so that we move over outstanding requests.
+			cid.opQueue.Close()
+			cid.opQueue.Drain(func(request *memdQRequest) {
+				err := newOpQueue.Push(request, 0)
+				if err != nil {
+					request.tryCallback(nil, err)
+				}
+			})
+		}
+		cid.opQueue = newOpQueue
 
 		// We attempt to send the refresh inside of the lock, that way we haven't released the lock and allowed an op
 		// to get queued if we need to move the status back to unknown. Without doing this it's possible for one or
@@ -639,6 +655,21 @@ func setRequestCid(req *memdQRequest, cid uint32) error {
 	}
 	req.CollectionID = cid
 	return nil
+}
+
+func canRetryOnCollectionUnknown(req *memdQRequest) bool {
+	switch req.Command {
+	case memd.CmdCollectionsGetID:
+		return false
+	case memd.CmdRangeScanContinue:
+		return false
+	case memd.CmdRangeScanCancel:
+		return false
+	case memd.CmdDcpStreamReq:
+		return false
+	}
+
+	return true
 }
 
 func isDefaultCollection(scopeName, collectionName string) bool {

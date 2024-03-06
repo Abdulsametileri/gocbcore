@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io/ioutil"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -205,45 +206,103 @@ func parseN1QLError(respBody []byte) (string, []N1QLErrorDesc, error) {
 		firstErr := errorDescs[0]
 		errCode := firstErr.Code
 		errCodeGroup := errCode / 1000
+		msgLower := strings.ToLower(firstErr.Message)
 
-		if errCodeGroup == 4 {
-			err = errPlanningFailure
-		}
-		if errCodeGroup == 5 {
-			err = errInternalServerFailure
-		}
-		if errCodeGroup == 12 || errCodeGroup == 14 && errCode != 12004 && errCode != 12016 {
+		switch errCodeGroup {
+		case 1:
+			switch errCode {
+			case 1065:
+				if strings.Contains(msgLower, "query_context") {
+					err = wrapError(errFeatureNotAvailable, "this server requires that a query context be used for queries")
+				} else if strings.Contains(msgLower, "preserve_expiry") {
+					err = wrapError(errFeatureNotAvailable, "this server does not support preserve expiry")
+				} else if strings.Contains(msgLower, "use_replica") {
+					err = wrapError(errFeatureNotAvailable, "this server does not support use replica")
+				}
+			case 1080:
+				// This can happen when the server starts streaming responses - at this point our timeout is already
+				// canceled. But then the streaming takes longer than the configured timeout, in which case the query
+				// engine will proactively send us a timeout and we need to convert it.
+				err = errUnambiguousTimeout
+			case 1191:
+				err = errRateLimitedFailure
+			case 1192:
+				err = errRateLimitedFailure
+			case 1193:
+				err = errRateLimitedFailure
+			case 1194:
+				err = errRateLimitedFailure
+			case 1197:
+				err = wrapError(errFeatureNotAvailable, "this server requires that a query context be used for queries")
+			}
+		case 3:
+			switch errCode {
+			case 3000:
+				err = errParsingFailure
+			case 3230:
+				if strings.Contains(msgLower, "advisor") || strings.Contains(msgLower, "advise") {
+					err = wrapError(errFeatureNotAvailable, "query index advisor is not supported on community edition")
+				} else if strings.Contains(msgLower, "query window functions") {
+					err = wrapError(errFeatureNotAvailable, "query window functions are not supported on community edition")
+				}
+			}
+		case 4:
+			switch errCode {
+			case 4040:
+				err = errPreparedStatementFailure
+			case 4050:
+				err = errPreparedStatementFailure
+			case 4060:
+				err = errPreparedStatementFailure
+			case 4070:
+				err = errPreparedStatementFailure
+			case 4080:
+				err = errPreparedStatementFailure
+			case 4090:
+				err = errPreparedStatementFailure
+			case 4300:
+				err = errIndexExists
+			default:
+				err = errPlanningFailure
+			}
+		case 5:
+			switch errCode {
+			case 5000:
+				if match, matchErr := regexp.MatchString(".*?ndex .*? not found.*", msgLower); matchErr == nil && match {
+					err = errIndexNotFound
+				} else if match, matchErr := regexp.MatchString(".*?ndex does not exist.*", msgLower); matchErr == nil && match {
+					err = errIndexNotFound
+				} else if match, matchErr := regexp.MatchString(".*?ndex .*? already exist.*", msgLower); matchErr == nil && match {
+					err = errIndexExists
+				} else if strings.Contains(msgLower,
+					"limit for number of indexes that can be created per scope has been reached") {
+					err = errQuotaLimitedFailure
+				} else {
+					err = errInternalServerFailure
+				}
+			default:
+				err = errInternalServerFailure
+			}
+		case 10:
+			err = errAuthenticationFailure
+		case 12:
+			switch errCode {
+			case 12004:
+				err = errIndexNotFound
+			case 12016:
+				err = errIndexNotFound
+			case 12009:
+				err = extractN1QL12009Error(firstErr)
+			default:
+				err = errIndexFailure
+			}
+		case 13:
+			switch errCode {
+			case 13014:
+				err = errAuthenticationFailure
+			}
+		case 14:
 			err = errIndexFailure
-		}
-		if errCode == 4040 || errCode == 4050 || errCode == 4060 || errCode == 4070 || errCode == 4080 || errCode == 4090 {
-			err = errPreparedStatementFailure
-		}
-
-		if errCode == 1191 || errCode == 1192 || errCode == 1193 || errCode == 1194 {
-			err = errRateLimitedFailure
-		}
-		if errCode == 5000 && strings.Contains(strings.ToLower(firstErr.Message),
-			"limit for number of indexes that can be created per scope has been reached") {
-			err = errQuotaLimitedFailure
-		}
-		if errCode == 1080 {
-			err = errUnambiguousTimeout
-		}
-
-		if errCode == 3000 {
-			err = errParsingFailure
-		}
-		if errCode == 12009 {
-			err = extractN1QL12009Error(firstErr)
-		}
-		if errCode == 13014 {
-			err = errAuthenticationFailure
-		}
-		if errCode == 1197 {
-			err = wrapError(errFeatureNotAvailable, "this server requires that a query context be used for queries")
-		}
-		if errCodeGroup == 10 {
-			err = errAuthenticationFailure
 		}
 	}
 	var rawErrors string
@@ -274,35 +333,40 @@ type n1qlQueryComponent struct {
 }
 
 type n1qlQueryCache struct {
-	cache     map[string]*n1qlQueryCacheEntry
+	cache     map[n1qlQueryCacheStatementContext]*n1qlQueryCacheEntry
 	cacheLock sync.RWMutex
+}
+
+type n1qlQueryCacheStatementContext struct {
+	Statement string
+	Context   string
 }
 
 func newN1qlQueryCache() *n1qlQueryCache {
 	return &n1qlQueryCache{
-		cache: make(map[string]*n1qlQueryCacheEntry),
+		cache: make(map[n1qlQueryCacheStatementContext]*n1qlQueryCacheEntry),
 	}
 }
 
 func (cache *n1qlQueryCache) Invalidate() {
 	cache.cacheLock.Lock()
-	cache.cache = make(map[string]*n1qlQueryCacheEntry)
+	cache.cache = make(map[n1qlQueryCacheStatementContext]*n1qlQueryCacheEntry)
 	cache.cacheLock.Unlock()
 }
 
-func (cache *n1qlQueryCache) Put(statement string, entry *n1qlQueryCacheEntry) {
+func (cache *n1qlQueryCache) Put(statement n1qlQueryCacheStatementContext, entry *n1qlQueryCacheEntry) {
 	cache.cacheLock.Lock()
 	cache.cache[statement] = entry
 	cache.cacheLock.Unlock()
 }
 
-func (cache *n1qlQueryCache) Delete(statement string) {
+func (cache *n1qlQueryCache) Delete(statement n1qlQueryCacheStatementContext) {
 	cache.cacheLock.Lock()
 	delete(cache.cache, statement)
 	cache.cacheLock.Unlock()
 }
 
-func (cache *n1qlQueryCache) Get(statement string) *n1qlQueryCacheEntry {
+func (cache *n1qlQueryCache) Get(statement n1qlQueryCacheStatementContext) *n1qlQueryCacheEntry {
 	cache.cacheLock.RLock()
 	entry := cache.cache[statement]
 	if entry == nil {
@@ -447,8 +511,13 @@ func (nqc *n1qlQueryComponent) executePrepared(ctx context.Context, cancel conte
 			return nil, wrapN1QLError(nil, "", wrapError(errFeatureNotAvailable, "use replica is not supported by this cluster version"), "", 0)
 		}
 	}
+	queryCtx := getMapValueString(payloadMap, "query_context", "")
+	statementCtx := n1qlQueryCacheStatementContext{
+		Statement: statement,
+		Context:   queryCtx,
+	}
 
-	cachedStmt := nqc.queryCache.Get(statement)
+	cachedStmt := nqc.queryCache.Get(statementCtx)
 
 	enhanced := atomic.LoadUint32(&nqc.enhancedPreparedSupported) == 1
 
@@ -481,7 +550,7 @@ func (nqc *n1qlQueryComponent) executePrepared(ctx context.Context, cancel conte
 			return results, nil
 		}
 
-		retryErr := nqc.preparedStatementMaybeEvictAndRetry(req, err, start, statement)
+		retryErr := nqc.preparedStatementMaybeEvictAndRetry(req, err, start, statementCtx)
 		if retryErr != nil {
 			return nil, retryErr
 		}
@@ -520,15 +589,15 @@ func (nqc *n1qlQueryComponent) executePrepared(ctx context.Context, cancel conte
 		var res *N1QLRowReader
 		var err error
 		if enhanced {
-			res, err = nqc.executeEnhPrepared(req, payloadMap, statement, start)
+			res, err = nqc.executeEnhPrepared(req, payloadMap, statementCtx, start)
 		} else {
-			res, err = nqc.executeOldPrepared(req, payloadMap, statement, start)
+			res, err = nqc.executeOldPrepared(req, payloadMap, statementCtx, start)
 		}
 		if err == nil {
 			return res, nil
 		}
 
-		err = nqc.preparedStatementMaybeEvictAndRetry(req, err, start, statement)
+		err = nqc.preparedStatementMaybeEvictAndRetry(req, err, start, statementCtx)
 		if err != nil {
 			return nil, err
 		}
@@ -536,7 +605,7 @@ func (nqc *n1qlQueryComponent) executePrepared(ctx context.Context, cancel conte
 }
 
 func (nqc *n1qlQueryComponent) preparedStatementMaybeEvictAndRetry(req *httpRequest, originalErr error, start time.Time,
-	statement string) error {
+	statementCtx n1qlQueryCacheStatementContext) error {
 	var err *N1QLError
 	if !errors.As(originalErr, &err) {
 		return originalErr
@@ -551,7 +620,7 @@ func (nqc *n1qlQueryComponent) preparedStatementMaybeEvictAndRetry(req *httpRequ
 			retryReason = QueryPreparedStatementFailureRetryReason
 
 			// If the error is because of a prepared statement issue then we need to evict the cache entry and reprepare.
-			nqc.queryCache.Delete(statement)
+			nqc.queryCache.Delete(statementCtx)
 		}
 
 		if retryReason == nil {
@@ -576,7 +645,7 @@ func (nqc *n1qlQueryComponent) preparedStatementMaybeEvictAndRetry(req *httpRequ
 				RetryAttempts:    req.retryCount,
 				LastDispatchedTo: req.Endpoint,
 			}
-			return wrapN1QLError(req, statement, err, "", 0)
+			return wrapN1QLError(req, statementCtx.Statement, err, "", 0)
 		case <-time.After(time.Until(retryTime)):
 			return nil
 		}
@@ -586,8 +655,8 @@ func (nqc *n1qlQueryComponent) preparedStatementMaybeEvictAndRetry(req *httpRequ
 }
 
 func (nqc *n1qlQueryComponent) executeEnhPrepared(ireq *httpRequest, payloadMap map[string]interface{},
-	statement string, start time.Time) (*N1QLRowReader, error) {
-	cacheRes, err := nqc.execute(ireq, payloadMap, statement, start)
+	statementCtx n1qlQueryCacheStatementContext, start time.Time) (*N1QLRowReader, error) {
+	cacheRes, err := nqc.execute(ireq, payloadMap, statementCtx.Statement, start)
 	if err != nil {
 		return nil, err
 	}
@@ -601,20 +670,20 @@ func (nqc *n1qlQueryComponent) executeEnhPrepared(ireq *httpRequest, payloadMap 
 	cachedStmt := &n1qlQueryCacheEntry{}
 	cachedStmt.name = preparedName
 
-	nqc.queryCache.Put(statement, cachedStmt)
+	nqc.queryCache.Put(statementCtx, cachedStmt)
 
 	return cacheRes, nil
 }
 
-func (nqc *n1qlQueryComponent) executeOldPrepared(ireq *httpRequest, payloadMap map[string]interface{}, statement string,
+func (nqc *n1qlQueryComponent) executeOldPrepared(ireq *httpRequest, payloadMap map[string]interface{}, statementCtx n1qlQueryCacheStatementContext,
 	start time.Time) (*N1QLRowReader, error) {
 	delete(payloadMap, "prepared")
 	delete(payloadMap, "encoded_plan")
 	delete(payloadMap, "auto_execute")
-	prepStatement := "PREPARE " + statement
+	prepStatement := "PREPARE " + statementCtx.Statement
 	payloadMap["statement"] = prepStatement
 
-	cacheRes, err := nqc.execute(ireq, payloadMap, statement, start)
+	cacheRes, err := nqc.execute(ireq, payloadMap, statementCtx.Statement, start)
 	if err != nil {
 		return nil, err
 	}
@@ -626,15 +695,15 @@ func (nqc *n1qlQueryComponent) executeOldPrepared(ireq *httpRequest, payloadMap 
 		if metaErr == nil {
 			raw, descs, err := parseN1QLError(meta)
 			if err != nil {
-				n1qlError = wrapN1QLError(ireq, statement, err, raw, 0)
+				n1qlError = wrapN1QLError(ireq, statementCtx.Statement, err, raw, 0)
 				n1qlError.Errors = descs
 			} else if len(descs) > 0 {
-				n1qlError = wrapN1QLError(ireq, statement, nil, raw, 0)
+				n1qlError = wrapN1QLError(ireq, statementCtx.Statement, nil, raw, 0)
 				n1qlError.Errors = descs
 			}
 		}
 		if n1qlError == nil {
-			n1qlError = wrapN1QLError(ireq, statement, errCliInternalError, "", 0)
+			n1qlError = wrapN1QLError(ireq, statementCtx.Statement, errCliInternalError, "", 0)
 		}
 
 		return nil, n1qlError
@@ -643,21 +712,21 @@ func (nqc *n1qlQueryComponent) executeOldPrepared(ireq *httpRequest, payloadMap 
 	var prepData n1qlJSONPrepData
 	err = json.Unmarshal(b, &prepData)
 	if err != nil {
-		return nil, wrapN1QLError(ireq, statement, err, "", 0)
+		return nil, wrapN1QLError(ireq, statementCtx.Statement, err, "", 0)
 	}
 
 	cachedStmt := &n1qlQueryCacheEntry{}
 	cachedStmt.name = prepData.Name
 	cachedStmt.encodedPlan = prepData.EncodedPlan
 
-	nqc.queryCache.Put(statement, cachedStmt)
+	nqc.queryCache.Put(statementCtx, cachedStmt)
 
 	// Attempt to execute our cached query plan
 	delete(payloadMap, "statement")
 	payloadMap["prepared"] = cachedStmt.name
 	payloadMap["encoded_plan"] = cachedStmt.encodedPlan
 
-	resp, err := nqc.execute(ireq, payloadMap, statement, start)
+	resp, err := nqc.execute(ireq, payloadMap, statementCtx.Statement, start)
 	if err != nil {
 		return nil, err
 	}

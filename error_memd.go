@@ -18,11 +18,19 @@ func makeKvStatusError(code memd.StatusCode) error {
 	return err
 }
 
+type unknownKvStatusCodeError struct {
+	code memd.StatusCode
+}
+
+func (e unknownKvStatusCodeError) Error() string {
+	return e.code.String()
+}
+
 func getKvStatusCodeError(code memd.StatusCode) error {
 	if err := statusCodeErrorMap[code]; err != nil {
 		return err
 	}
-	return errors.New(code.String())
+	return &unknownKvStatusCodeError{code: code}
 }
 
 var (
@@ -54,6 +62,13 @@ var (
 
 	// ErrMemdLocked occurs when a document is already locked.
 	ErrMemdLocked = makeKvStatusError(memd.StatusLocked)
+
+	// ErrMemdConfigOnly occurs when an operation cannot be executed against a node because the bucket is in config-only
+	// mode.
+	ErrMemdConfigOnly = makeKvStatusError(memd.StatusConfigOnly)
+
+	// ErrMemdNotLocked occurs when an operation attempts to unlock a document which is not locked.
+	ErrMemdNotLocked = makeKvStatusError(memd.StatusNotLocked)
 
 	// ErrMemdAuthStale occurs when authentication credentials have become invalidated.
 	ErrMemdAuthStale = makeKvStatusError(memd.StatusAuthStale)

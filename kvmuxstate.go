@@ -10,7 +10,8 @@ type kvMuxState struct {
 
 	routeCfg routeConfig
 
-	bucketCapabilities   map[BucketCapability]BucketCapabilityStatus
+	expectedBucketName   string
+	bucketCapabilities   map[BucketCapability]CapabilityStatus
 	collectionsSupported bool
 
 	kvServerList   []routeEndpoint
@@ -20,20 +21,21 @@ type kvMuxState struct {
 }
 
 func newKVMuxState(cfg *routeConfig, kvServerList []routeEndpoint, tlsConfig *dynTLSConfig,
-	authMechanisms []AuthMechanism, auth AuthProvider, pipelines []*memdPipeline, deadpipe *memdPipeline) *kvMuxState {
+	authMechanisms []AuthMechanism, auth AuthProvider, expectedBucketName string, pipelines []*memdPipeline, deadpipe *memdPipeline) *kvMuxState {
 	mux := &kvMuxState{
 		pipelines: pipelines,
 		deadPipe:  deadpipe,
 
 		routeCfg: *cfg,
 
-		bucketCapabilities: map[BucketCapability]BucketCapabilityStatus{
-			BucketCapabilityDurableWrites:        BucketCapabilityStatusUnknown,
-			BucketCapabilityCreateAsDeleted:      BucketCapabilityStatusUnknown,
-			BucketCapabilityReplaceBodyWithXattr: BucketCapabilityStatusUnknown,
-			BucketCapabilityRangeScan:            BucketCapabilityStatusUnknown,
-			BucketCapabilityReplicaRead:          BucketCapabilityStatusUnknown,
-			BucketCapabilityNonDedupedHistory:    BucketCapabilityStatusUnknown,
+		expectedBucketName: expectedBucketName,
+		bucketCapabilities: map[BucketCapability]CapabilityStatus{
+			BucketCapabilityDurableWrites:        CapabilityStatusUnknown,
+			BucketCapabilityCreateAsDeleted:      CapabilityStatusUnknown,
+			BucketCapabilityReplaceBodyWithXattr: CapabilityStatusUnknown,
+			BucketCapabilityRangeScan:            CapabilityStatusUnknown,
+			BucketCapabilityReplicaRead:          CapabilityStatusUnknown,
+			BucketCapabilityNonDedupedHistory:    CapabilityStatusUnknown,
 		},
 
 		collectionsSupported: cfg.ContainsBucketCapability("collections"),
@@ -45,41 +47,42 @@ func newKVMuxState(cfg *routeConfig, kvServerList []routeEndpoint, tlsConfig *dy
 	}
 
 	// We setup with a fake config, this means that durability support is still unknown.
-	if cfg.revID > -1 {
+	// We only want to update bucket capabilities once we actually have a bucket config.
+	if cfg.revID > -1 && cfg.name == expectedBucketName {
 		if cfg.ContainsBucketCapability("durableWrite") {
-			mux.bucketCapabilities[BucketCapabilityDurableWrites] = BucketCapabilityStatusSupported
+			mux.bucketCapabilities[BucketCapabilityDurableWrites] = CapabilityStatusSupported
 		} else {
-			mux.bucketCapabilities[BucketCapabilityDurableWrites] = BucketCapabilityStatusUnsupported
+			mux.bucketCapabilities[BucketCapabilityDurableWrites] = CapabilityStatusUnsupported
 		}
 
 		if cfg.ContainsBucketCapability("tombstonedUserXAttrs") {
-			mux.bucketCapabilities[BucketCapabilityCreateAsDeleted] = BucketCapabilityStatusSupported
+			mux.bucketCapabilities[BucketCapabilityCreateAsDeleted] = CapabilityStatusSupported
 		} else {
-			mux.bucketCapabilities[BucketCapabilityCreateAsDeleted] = BucketCapabilityStatusUnsupported
+			mux.bucketCapabilities[BucketCapabilityCreateAsDeleted] = CapabilityStatusUnsupported
 		}
 
 		if cfg.ContainsBucketCapability("subdoc.ReplaceBodyWithXattr") {
-			mux.bucketCapabilities[BucketCapabilityReplaceBodyWithXattr] = BucketCapabilityStatusSupported
+			mux.bucketCapabilities[BucketCapabilityReplaceBodyWithXattr] = CapabilityStatusSupported
 		} else {
-			mux.bucketCapabilities[BucketCapabilityReplaceBodyWithXattr] = BucketCapabilityStatusUnsupported
+			mux.bucketCapabilities[BucketCapabilityReplaceBodyWithXattr] = CapabilityStatusUnsupported
 		}
 
 		if cfg.ContainsBucketCapability("rangeScan") {
-			mux.bucketCapabilities[BucketCapabilityRangeScan] = BucketCapabilityStatusSupported
+			mux.bucketCapabilities[BucketCapabilityRangeScan] = CapabilityStatusSupported
 		} else {
-			mux.bucketCapabilities[BucketCapabilityRangeScan] = BucketCapabilityStatusUnsupported
+			mux.bucketCapabilities[BucketCapabilityRangeScan] = CapabilityStatusUnsupported
 		}
 
 		if cfg.ContainsBucketCapability("subdoc.ReplicaRead") {
-			mux.bucketCapabilities[BucketCapabilityReplicaRead] = BucketCapabilityStatusSupported
+			mux.bucketCapabilities[BucketCapabilityReplicaRead] = CapabilityStatusSupported
 		} else {
-			mux.bucketCapabilities[BucketCapabilityReplicaRead] = BucketCapabilityStatusUnsupported
+			mux.bucketCapabilities[BucketCapabilityReplicaRead] = CapabilityStatusUnsupported
 		}
 
 		if cfg.ContainsBucketCapability("nonDedupedHistory") {
-			mux.bucketCapabilities[BucketCapabilityNonDedupedHistory] = BucketCapabilityStatusSupported
+			mux.bucketCapabilities[BucketCapabilityNonDedupedHistory] = CapabilityStatusSupported
 		} else {
-			mux.bucketCapabilities[BucketCapabilityNonDedupedHistory] = BucketCapabilityStatusUnsupported
+			mux.bucketCapabilities[BucketCapabilityNonDedupedHistory] = CapabilityStatusUnsupported
 		}
 	}
 
@@ -129,19 +132,19 @@ func (mux *kvMuxState) GetPipeline(index int) *memdPipeline {
 	return mux.pipelines[index]
 }
 
-func (mux *kvMuxState) HasBucketCapabilityStatus(cap BucketCapability, status BucketCapabilityStatus) bool {
+func (mux *kvMuxState) HasBucketCapabilityStatus(cap BucketCapability, status CapabilityStatus) bool {
 	st, ok := mux.bucketCapabilities[cap]
 	if !ok {
-		return status == BucketCapabilityStatusUnsupported
+		return status == CapabilityStatusUnsupported
 	}
 
 	return st == status
 }
 
-func (mux *kvMuxState) BucketCapabilityStatus(cap BucketCapability) BucketCapabilityStatus {
+func (mux *kvMuxState) BucketCapabilityStatus(cap BucketCapability) CapabilityStatus {
 	st, ok := mux.bucketCapabilities[cap]
 	if !ok {
-		return BucketCapabilityStatusUnsupported
+		return CapabilityStatusUnsupported
 	}
 
 	return st

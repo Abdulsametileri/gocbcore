@@ -16,13 +16,13 @@ import (
 )
 
 type bucketCapabilityVerifier interface {
-	HasBucketCapabilityStatus(cap BucketCapability, status BucketCapabilityStatus) bool
+	HasBucketCapabilityStatus(cap BucketCapability, status CapabilityStatus) bool
 }
 
 type dispatcher interface {
 	DispatchDirect(req *memdQRequest) (PendingOp, error)
 	RequeueDirect(req *memdQRequest, isRetry bool)
-	DispatchDirectToAddress(req *memdQRequest, pipeline *memdPipeline) (PendingOp, error)
+	DispatchDirectToAddress(req *memdQRequest, address string) (PendingOp, error)
 	CollectionsEnabled() bool
 	SupportsCollections() bool
 	SetPostCompleteErrorHandler(handler postCompleteErrorHandler)
@@ -36,6 +36,7 @@ type clientProvider interface {
 type kvMux struct {
 	muxPtr unsafe.Pointer
 
+	bucketName         string
 	collectionsEnabled bool
 	queueSize          int
 	poolSize           int
@@ -85,6 +86,7 @@ func newKVMux(props kvMuxProps, cfgMgr *configManagementComponent, errMapMgr *er
 		noTLSSeedNode:      props.NoTLSSeedNode,
 		muxPtr:             unsafe.Pointer(muxState),
 		hasSeenConfigCh:    make(chan struct{}),
+		bucketName:         muxState.expectedBucketName,
 	}
 
 	cfgMgr.AddConfigWatcher(mux)
@@ -259,19 +261,19 @@ func (mux *kvMux) SupportsCollections() bool {
 	return clientMux.collectionsSupported
 }
 
-func (mux *kvMux) HasBucketCapabilityStatus(cap BucketCapability, status BucketCapabilityStatus) bool {
+func (mux *kvMux) HasBucketCapabilityStatus(cap BucketCapability, status CapabilityStatus) bool {
 	clientMux := mux.getState()
 	if clientMux == nil {
-		return status == BucketCapabilityStatusUnknown
+		return status == CapabilityStatusUnknown
 	}
 
 	return clientMux.HasBucketCapabilityStatus(cap, status)
 }
 
-func (mux *kvMux) BucketCapabilityStatus(cap BucketCapability) BucketCapabilityStatus {
+func (mux *kvMux) BucketCapabilityStatus(cap BucketCapability) CapabilityStatus {
 	clientMux := mux.getState()
 	if clientMux == nil || clientMux.RevID() == -1 {
-		return BucketCapabilityStatusUnknown
+		return CapabilityStatusUnknown
 	}
 
 	return clientMux.BucketCapabilityStatus(cap)
@@ -435,7 +437,7 @@ func (mux *kvMux) GetByConnID(connID string) (*memdClient, error) {
 
 }
 
-func (mux *kvMux) DispatchDirectToAddress(req *memdQRequest, pipeline *memdPipeline) (PendingOp, error) {
+func (mux *kvMux) DispatchDirectToAddress(req *memdQRequest, address string) (PendingOp, error) {
 	mux.tracer.StartCmdTrace(req)
 	req.dispatchTime = time.Now()
 
@@ -447,6 +449,23 @@ func (mux *kvMux) DispatchDirectToAddress(req *memdQRequest, pipeline *memdPipel
 	req.ReplicaIdx = -999999999
 
 	for {
+		clientMux := mux.getState()
+		if clientMux == nil {
+			return nil, errShutdown
+		}
+
+		var pipeline *memdPipeline
+		for _, p := range clientMux.pipelines {
+			if p.Address() == address {
+				pipeline = p
+				break
+			}
+		}
+
+		if pipeline == nil {
+			return nil, errInvalidServer
+		}
+
 		err := pipeline.SendRequest(req)
 		if err == errPipelineClosed {
 			continue
@@ -627,6 +646,13 @@ func (mux *kvMux) handleOpRoutingResp(resp *memdQResponse, req *memdQRequest, or
 				if mux.waitAndRetryOperation(req, SocketNotAvailableRetryReason) {
 					return true, nil
 				}
+			} else {
+				// If the request has been dispatched then the retry reason is in flight.
+				// For not causing a breaking change reasons we use socket not available for all idempotent
+				// requests.
+				if mux.waitAndRetryOperation(req, SocketCloseInFlightRetryReason) {
+					return true, nil
+				}
 			}
 		} else if errors.Is(err, ErrMemdClientClosed) && !mux.closed() {
 			if req.Command == memd.CmdGetClusterConfig {
@@ -641,6 +667,11 @@ func (mux *kvMux) handleOpRoutingResp(resp *memdQResponse, req *memdQRequest, or
 			// This is a special case where the write has failed on the underlying connection and not all the bytes
 			// were written to the network.
 			if mux.waitAndRetryOperation(req, MemdWriteFailure) {
+				return true, nil
+			}
+		} else if errors.Is(err, ErrMemdConfigOnly) {
+			logWarnf("Received config-only status, will attempt to refresh config map and retry operation")
+			if mux.handleConfigOnly(resp, req) {
 				return true, nil
 			}
 		} else if resp != nil && resp.Magic == memd.CmdMagicRes {
@@ -761,6 +792,26 @@ func (mux *kvMux) handleNotMyVbucket(resp *memdQResponse, req *memdQRequest) boo
 	return mux.waitAndRetryOperation(req, KVNotMyVBucketRetryReason)
 }
 
+func (mux *kvMux) handleConfigOnly(resp *memdQResponse, req *memdQRequest) bool {
+	snapshot, err := mux.PipelineSnapshot()
+	if err != nil {
+		logInfof("Failed to get pipeline snapshot: %s", err)
+		// Not much we can do here, attempt a retry.
+		mux.RequeueDirect(req, true)
+		return true
+	}
+
+	go func() {
+		// Don't block the client read loop whilst we apply the config and redispatch.
+		// For a start if the node this status has originated from is now not in the config then
+		// calling RefreshConfig will end up blocking because we're holding the client read thread open
+		// whilst also trying to shutdown the client.
+		mux.cfgMgr.RefreshConfig(snapshot)
+		mux.RequeueDirect(req, true)
+	}()
+	return true
+}
+
 func (mux *kvMux) drainPipelines(clientMux *kvMuxState, cb func(req *memdQRequest)) {
 	for _, pipeline := range clientMux.pipelines {
 		logDebugf("Draining queue %+v", pipeline)
@@ -829,7 +880,7 @@ func (mux *kvMux) newKVMuxState(cfg *routeConfig, tlsConfig *dynTLSConfig, authM
 		pipelines[i] = pipeline
 	}
 
-	return newKVMuxState(cfg, kvServerList, tlsConfig, authMechanisms, auth, pipelines,
+	return newKVMuxState(cfg, kvServerList, tlsConfig, authMechanisms, auth, mux.bucketName, pipelines,
 		newDeadPipeline(mux.queueSize))
 }
 
@@ -988,6 +1039,7 @@ func (mux *kvMux) handleServerRequest(pak *memd.Packet) {
 			snapshot, err := mux.PipelineSnapshot()
 			if err != nil {
 				logInfof("Failed to get pipeline snapshot: %s", err)
+				return
 			}
 			mux.cfgMgr.OnNewConfigChangeNotifBrief(snapshot, extras)
 		}()

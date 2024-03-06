@@ -15,83 +15,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/couchbase/gocbcore/v10/memd"
 )
-
-func (suite *StandardTestSuite) TestCidRetries() {
-	suite.EnsureSupportsFeature(TestFeatureCollections)
-
-	agent, s := suite.GetAgentAndHarness()
-
-	bucketName := suite.BucketName
-	scopeName := suite.ScopeName
-	collectionName := "testCidRetries"
-
-	_, err := testCreateCollection(collectionName, scopeName, bucketName, agent)
-	if err != nil {
-		suite.T().Logf("Failed to create collection: %v", err)
-	}
-
-	// prime the cid map cache
-	s.PushOp(agent.GetCollectionID(scopeName, collectionName, GetCollectionIDOptions{},
-		func(result *GetCollectionIDResult, err error) {
-			s.Wrap(func() {
-				if err != nil {
-					s.Fatalf("Get CID operation failed: %v", err)
-				}
-			})
-		}),
-	)
-	s.Wait(0)
-
-	// delete the collection
-	_, err = testDeleteCollection(collectionName, scopeName, bucketName, agent, true)
-	if err != nil {
-		suite.T().Fatalf("Failed to delete collection: %v", err)
-	}
-
-	// recreate
-	_, err = testCreateCollection(collectionName, scopeName, bucketName, agent)
-	if err != nil {
-		suite.T().Fatalf("Failed to create collection: %v", err)
-	}
-
-	// Set should succeed as we detect cid unknown, fetch the cid and then retry again. This should happen
-	// even if we don't set a retry strategy.
-	s.PushOp(agent.Set(SetOptions{
-		Key:            []byte("test"),
-		Value:          []byte("{}"),
-		CollectionName: collectionName,
-		ScopeName:      scopeName,
-	}, func(res *StoreResult, err error) {
-		s.Wrap(func() {
-			if err != nil {
-				s.Fatalf("Set operation failed: %v", err)
-			}
-			if res.Cas == Cas(0) {
-				s.Fatalf("Invalid cas received")
-			}
-		})
-	}))
-	s.Wait(0)
-
-	// Get
-	s.PushOp(agent.Get(GetOptions{
-		Key:            []byte("test"),
-		CollectionName: collectionName,
-		ScopeName:      scopeName,
-	}, func(res *GetResult, err error) {
-		s.Wrap(func() {
-			if err != nil {
-				s.Fatalf("Get operation failed: %v", err)
-			}
-			if res.Cas == Cas(0) {
-				s.Fatalf("Invalid cas received")
-			}
-		})
-	}))
-	s.Wait(0)
-}
 
 func (suite *StandardTestSuite) TestPreserveExpirySet() {
 	suite.EnsureSupportsFeature(TestFeaturePreserveExpiry)
@@ -228,7 +155,7 @@ func (suite *StandardTestSuite) TestPreserveExpiryReplace() {
 			}
 			expectedExpiry := uint32(time.Now().Unix() + int64(expiry-5))
 			if res.Expiry < expectedExpiry {
-				s.Fatalf("Invalid expiry received")
+				s.Fatalf("Invalid expiry received, expected %d, was %d", expectedExpiry, res.Expiry)
 			}
 		})
 	}))
@@ -1666,14 +1593,40 @@ func (suite *StandardTestSuite) TestObserveSeqNo() {
 func (suite *StandardTestSuite) TestRandomGet() {
 	agent, s := suite.GetAgentAndHarness()
 
+	var mustHaveValue bool
+	var scope, collection string
+	var durability memd.DurabilityLevel
+	var duraTimeout time.Duration
+	if suite.SupportsFeature(TestFeatureCollections) {
+		mustHaveValue = true
+		scope = uuid.NewString()[:6]
+		collection = uuid.NewString()[:6]
+
+		_, err := testCreateScope(scope, agent.BucketName(), agent)
+		suite.Require().NoError(err)
+
+		_, err = testCreateCollection(collection, scope, agent.BucketName(), agent)
+		suite.Require().NoError(err)
+
+		if agent.kvMux.NumReplicas() > 0 {
+			// We use persist to force the doc to disk.
+			durability = memd.DurabilityLevelPersistToMajority
+			duraTimeout = 5 * time.Second
+		}
+	}
+
+	suite.tracer.Reset()
+
 	distkeys, err := MakeDistKeys(agent, time.Now().Add(2*time.Second))
 	suite.Require().Nil(err, err)
 	for _, k := range distkeys {
 		s.PushOp(agent.Set(SetOptions{
-			Key:            []byte(k),
-			Value:          []byte("Hello World!"),
-			CollectionName: suite.CollectionName,
-			ScopeName:      suite.ScopeName,
+			Key:                    []byte(k),
+			Value:                  []byte("Hello World!"),
+			CollectionName:         collection,
+			ScopeName:              scope,
+			DurabilityLevel:        durability,
+			DurabilityLevelTimeout: duraTimeout,
 		}, func(res *StoreResult, err error) {
 			s.Wrap(func() {
 				if err != nil {
@@ -1684,30 +1637,42 @@ func (suite *StandardTestSuite) TestRandomGet() {
 		s.Wait(0)
 	}
 
-	s.PushOp(agent.GetRandom(GetRandomOptions{
-		CollectionName: suite.CollectionName,
-		ScopeName:      suite.ScopeName,
-	}, func(res *GetRandomResult, err error) {
-		s.Wrap(func() {
-			if err != nil {
-				s.Fatalf("Get operation failed: %v", err)
-			}
-			if res.Cas == Cas(0) {
-				s.Fatalf("Invalid cas received")
-			}
-			if len(res.Key) == 0 {
-				s.Fatalf("Invalid key returned")
-			}
-			if len(res.Value) == 0 {
-				s.Fatalf("No value returned")
-			}
-		})
-	}))
-	s.Wait(0)
+	var attempts int
+	var res *GetRandomResult
+	suite.Require().Eventually(func() bool {
+		attempts++
+		s.PushOp(agent.GetRandom(GetRandomOptions{
+			CollectionName: collection,
+			ScopeName:      scope,
+		}, func(res1 *GetRandomResult, err error) {
+			s.Wrap(func() {
+				if err != nil {
+					suite.T().Logf("Get operation failed: %v", err)
+					return
+				}
+				res = res1
+			})
+		}))
+		s.Wait(0)
+
+		return res != nil
+	}, 10*time.Second, 500*time.Millisecond)
+
+	if res.Cas == Cas(0) {
+		s.Fatalf("Invalid cas received")
+	}
+	if len(res.Key) == 0 {
+		s.Fatalf("Invalid key returned")
+	}
+	if mustHaveValue {
+		if len(res.Value) == 0 {
+			s.Fatalf("No value returned")
+		}
+	}
 
 	if suite.Assert().Contains(suite.tracer.Spans, nil) {
 		nilParents := suite.tracer.Spans[nil]
-		if suite.Assert().Equal(len(distkeys)+1, len(nilParents)) {
+		if suite.Assert().Equal(len(distkeys)+attempts, len(nilParents)) {
 			for i, k := range distkeys {
 				suite.AssertOpSpan(nilParents[i], "Set", agent.BucketName(), memd.CmdSet.Name(), 1, false, k)
 			}
@@ -1716,7 +1681,7 @@ func (suite *StandardTestSuite) TestRandomGet() {
 	}
 
 	suite.VerifyKVMetrics(suite.meter, "Set", len(distkeys), false, false)
-	suite.VerifyKVMetrics(suite.meter, "GetRandom", 1, false, false)
+	suite.VerifyKVMetrics(suite.meter, "GetRandom", attempts, false, false)
 }
 
 func (suite *StandardTestSuite) TestStats() {

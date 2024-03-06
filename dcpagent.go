@@ -253,6 +253,7 @@ func CreateDcpAgent(config *DCPAgentConfig, dcpStreamName string, openFlags memd
 				disableBufferAcknowledgement: config.DCPConfig.DisableBufferAcknowledgement,
 				useOSOBackfill:               config.DCPConfig.UseOSOBackfill,
 				useStreamID:                  config.DCPConfig.UseStreamID,
+				useChangeStreams:             config.DCPConfig.UseChangeStreams,
 				useExpiryOpcode:              config.DCPConfig.UseExpiryOpcode,
 				backfillOrderStr:             dcpBackfillOrderStr,
 				priorityStr:                  dcpPriorityStr,
@@ -290,9 +291,10 @@ func CreateDcpAgent(config *DCPAgentConfig, dcpStreamName string, openFlags memd
 		c.tracer,
 		c.dialer,
 		&kvMuxState{
-			tlsConfig:      tlsConfig,
-			authMechanisms: c.authMechanisms,
-			auth:           config.SecurityConfig.Auth,
+			tlsConfig:          tlsConfig,
+			authMechanisms:     c.authMechanisms,
+			auth:               config.SecurityConfig.Auth,
+			expectedBucketName: c.bucketName,
 		},
 	)
 	c.httpMux = newHTTPMux(
@@ -339,9 +341,10 @@ func CreateDcpAgent(config *DCPAgentConfig, dcpStreamName string, openFlags memd
 				c.cfgManager,
 			)
 		}
-		cccpFetcher := newCCCPConfigFetcher(confCccpMaxWait)
-		poller = newPollerController(
-			newCCCPConfigController(
+		var cccpPoller *cccpConfigController
+		if config.EnableCCCPPoller {
+			cccpFetcher := newCCCPConfigFetcher(confCccpMaxWait)
+			cccpPoller = newCCCPConfigController(
 				cccpPollerProperties{
 					cccpConfigFetcher:  cccpFetcher,
 					confCccpPollPeriod: confCccpPollPeriod,
@@ -350,12 +353,15 @@ func CreateDcpAgent(config *DCPAgentConfig, dcpStreamName string, openFlags memd
 				c.cfgManager,
 				c.isPollingFallbackError,
 				c.onCCCPNoConfigFromAnyNode,
-			),
+			)
+			c.cfgManager.SetConfigFetcher(cccpFetcher)
+		}
+		poller = newPollerController(
+			cccpPoller,
 			httpPoller,
 			c.cfgManager,
 			c.isPollingFallbackError,
 		)
-		c.cfgManager.SetConfigFetcher(cccpFetcher)
 	}
 	c.pollerController = poller
 

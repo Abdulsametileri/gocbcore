@@ -707,15 +707,12 @@ func isErrorStatus(err error, code memd.StatusCode) bool {
 }
 
 var (
-	// errCircuitBreakerOpen is passed around internally to signal that an
-	// operation was cancelled due to the circuit breaker being open.
-	errCircuitBreakerOpen = errors.New("circuit breaker open")
-	errNoCCCPHosts        = errors.New("no cccp hosts available")
+	errNoCCCPHosts = errors.New("no cccp hosts available")
 )
 
 // This list contains protected versions of all the errors we throw
 // to ensure no users inadvertently rely on direct comparisons.
-// nolint: deadcode,varcheck
+// nolint: deadcode,varcheck,unused
 var (
 	errTimeout                  = ncError{ErrTimeout}
 	errRequestCanceled          = ncError{ErrRequestCanceled}
@@ -747,6 +744,7 @@ var (
 	errDocumentNotFound                  = ncError{ErrDocumentNotFound}
 	errDocumentUnretrievable             = ncError{ErrDocumentUnretrievable}
 	errDocumentLocked                    = ncError{ErrDocumentLocked}
+	errDocumentNotLocked                 = ncError{ErrDocumentNotLocked}
 	errValueTooLarge                     = ncError{ErrValueTooLarge}
 	errDocumentExists                    = ncError{ErrDocumentExists}
 	errNotStored                         = ncError{ErrNotStored}
@@ -818,4 +816,6 @@ var (
 	errRangeScanVbUUIDNotEqual = ncError{ErrRangeScanVbUUIDNotEqual}
 
 	errConnectionIDInvalid = ncError{ErrConnectionIDInvalid}
+
+	errCircuitBreakerOpen = ncError{ErrCircuitBreakerOpen}
 )

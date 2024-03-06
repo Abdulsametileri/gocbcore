@@ -131,6 +131,7 @@ var (
 	ErrDocumentNotFound                  = errors.New("document not found")
 	ErrDocumentUnretrievable             = errors.New("document unretrievable")
 	ErrDocumentLocked                    = errors.New("document locked")
+	ErrDocumentNotLocked                 = errors.New("document not locked")
 	ErrValueTooLarge                     = errors.New("value too large")
 	ErrDocumentExists                    = errors.New("document exists")
 	ErrValueNotJSON                      = errors.New("value not json")
@@ -165,6 +166,10 @@ var (
 
 	// Uncommitted: This API may change in the future.
 	ErrConnectionIDInvalid = errors.New("connection id unknown")
+
+	// Uncommitted: This API may change in the future
+	// Signals that an operation was cancelled due to the circuit breaker being open
+	ErrCircuitBreakerOpen = errors.New("circuit breaker open")
 )
 
 // Query Error Definitions RFC#58@15

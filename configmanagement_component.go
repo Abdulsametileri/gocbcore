@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"math/rand"
 	"sync"
+
+	"github.com/couchbase/gocbcore/v10/memd"
 )
 
 type configManagementComponent struct {
@@ -90,6 +92,10 @@ func (cm *configManagementComponent) CurrentRev() (int64, int64) {
 }
 
 func (cm *configManagementComponent) OnNewConfig(cfg *cfgBucket) {
+	cm.onNewConfig(cfg)
+}
+
+func (cm *configManagementComponent) onNewConfig(cfg *cfgBucket) bool {
 	var routeCfg *routeConfig
 	cm.configLock.Lock()
 	if cm.seenConfig {
@@ -97,21 +103,22 @@ func (cm *configManagementComponent) OnNewConfig(cfg *cfgBucket) {
 	} else {
 		routeCfg = cm.buildFirstRouteConfig(cfg, cm.useSSL)
 		if routeCfg == nil {
+			cm.configLock.Unlock()
 			// If the routeCfg isn't valid then ignore it.
-			return
+			return false
 		}
 		logDebugf("Using network type %s for connections", cm.networkType)
 	}
 	if !routeCfg.IsValid() {
 		cm.configLock.Unlock()
 		logDebugf("Routing data is not valid, skipping update: \n%s", routeCfg.DebugString())
-		return
+		return false
 	}
 
 	// There's something wrong with this route config so don't send it to the watchers.
 	if !cm.canUpdateRouteConfig(routeCfg) {
 		cm.configLock.Unlock()
-		return
+		return false
 	}
 
 	cm.currentConfig = routeCfg
@@ -130,6 +137,27 @@ func (cm *configManagementComponent) OnNewConfig(cfg *cfgBucket) {
 	for _, watcher := range watchers {
 		watcher.OnNewRouteConfig(routeCfg)
 	}
+
+	return true
+}
+
+func (cm *configManagementComponent) RefreshConfig(snapshot *pipelineSnapshot) {
+	currentRev, currentEpoch := cm.CurrentRev()
+	cm.configFetchSigLock.Lock()
+	if cm.configFetchSig != nil {
+		// Someone else is already fetching a config so let's bail out.
+		cm.configFetchSigLock.Unlock()
+		return
+	}
+	cm.configFetchSig = make(chan struct{})
+	cm.configFetchSigLock.Unlock()
+
+	cm.fetchConfig(snapshot, currentRev, currentEpoch)
+
+	cm.configFetchSigLock.Lock()
+	close(cm.configFetchSig)
+	cm.configFetchSig = nil
+	cm.configFetchSigLock.Unlock()
 }
 
 func (cm *configManagementComponent) OnNewConfigChangeNotifBrief(snapshot *pipelineSnapshot, notif []byte) {
@@ -176,6 +204,15 @@ func (cm *configManagementComponent) OnNewConfigChangeNotifBrief(snapshot *pipel
 		<-waitSig
 	}
 
+	cm.fetchConfig(snapshot, currentRev, currentEpoch)
+
+	cm.configFetchSigLock.Lock()
+	close(cm.configFetchSig)
+	cm.configFetchSig = nil
+	cm.configFetchSigLock.Unlock()
+}
+
+func (cm *configManagementComponent) fetchConfig(snapshot *pipelineSnapshot, currentRev, currentEpoch int64) {
 	numNodes := snapshot.NumPipelines()
 	nodeIdx := rand.Intn(numNodes) // #nosec G404
 
@@ -183,9 +220,13 @@ func (cm *configManagementComponent) OnNewConfigChangeNotifBrief(snapshot *pipel
 	// If we cannot get it from any node then we just return.
 	snapshot.Iterate(nodeIdx, func(pipeline *memdPipeline) bool {
 		nodeIdx = (nodeIdx + 1) % numNodes
+		if !pipeline.SupportsFeature(memd.FeatureClusterMapKnownVersion) {
+			// No point in sending a request to a node that doesn't support known versions.
+			return false
+		}
 		cfgBytes, err := cm.configFetcher.GetClusterConfig(pipeline, currentRev, currentEpoch, cm.shutdownSig)
 		if err != nil {
-			logInfof("CfgManager: Failed to fetch config: %s", err)
+			logDebugf("CfgManager: Failed to fetch config: %s", err)
 			return false
 		}
 		if len(cfgBytes) == 0 {
@@ -203,19 +244,12 @@ func (cm *configManagementComponent) OnNewConfigChangeNotifBrief(snapshot *pipel
 
 		bk, err := parseConfig(cfgBytes, hostName)
 		if err != nil {
-			logWarnf("CfgManager:Failed to parse config. %v", err)
+			logDebugf("CfgManager:Failed to parse config. %v", err)
 			return false
 		}
 
-		cm.OnNewConfig(bk)
-
-		return true
+		return cm.onNewConfig(bk)
 	})
-
-	cm.configFetchSigLock.Lock()
-	close(cm.configFetchSig)
-	cm.configFetchSig = nil
-	cm.configFetchSigLock.Unlock()
 }
 
 func (cm *configManagementComponent) Close() {
@@ -317,7 +351,7 @@ func (cm *configManagementComponent) buildFirstRouteConfig(config *cfgBucket, us
 
 		if cm.localLoopbackAddr == nil {
 			logWarnf("Ignoring config, nodesExt entry contained no thisNode node")
-			return nil
+			return &routeConfig{}
 		}
 	}
 	if cm.networkType != "" && cm.networkType != "auto" {
